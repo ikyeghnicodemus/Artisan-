@@ -1,0 +1,558 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# generate_artisan_finder.sh
+# Creates the scaffolded Artisan Finder project files and folders.
+# Usage:
+#   ./generate_artisan_finder.sh        # create files only
+#   ./generate_artisan_finder.sh --install   # create files and run npm install in server and client
+
+ROOT_DIR="$(pwd)"
+
+echo "Creating Artisan Finder scaffold in ${ROOT_DIR} ..."
+
+# Utility to write files with directories
+write_file() {
+  local filepath="$1"
+  local content="$2"
+  mkdir -p "$(dirname "$filepath")"
+  cat > "$filepath" <<'EOF'
+'"$content"'
+EOF
+}
+
+# We'll use here-documents for each file (single-quoted EOF to avoid variable expansion).
+
+mkdir -p server/prisma server/src/middleware server/src/routes client/src client/src/pages client/src/components client/src/context
+
+# Root README.md
+cat > README.md <<'EOF'
+# My-3MTT-knowledge-showcase-1
+
+Scaffold for Artisan Finder project (React + Express + Prisma/SQLite).
+
+This branch contains a starter full-stack scaffold to build the Artisan Finder app.
+
+See server/ and client/ directories.
+EOF
+
+# .gitignore
+cat > .gitignore <<'EOF'
+node_modules
+.env
+server/node_modules
+client/node_modules
+EOF
+
+# server/package.json
+cat > server/package.json <<'EOF'
+{
+  "name": "artisan-finder-server",
+  "version": "0.1.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "nodemon index.js --watch .",
+    "start": "node index.js",
+    "prisma:migrate": "prisma migrate dev --name init",
+    "prisma:generate": "prisma generate"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.0.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22",
+    "prisma": "^5.0.0"
+  }
+}
+EOF
+
+# server/.env.example
+cat > server/.env.example <<'EOF'
+DATABASE_URL="file:./dev.db"
+JWT_SECRET="change-me-in-prod"
+PORT=4000
+EOF
+
+# server/index.js
+cat > server/index.js <<'EOF'
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import authRoutes from "./src/routes/auth.js";
+import artisanRoutes from "./src/routes/artisans.js";
+import bookingRoutes from "./src/routes/bookings.js";
+
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+app.get("/", (req, res) => res.json({ ok: true, message: "Artisan Finder API" }));
+app.use("/api/auth", authRoutes);
+app.use("/api/artisans", artisanRoutes);
+app.use("/api/bookings", bookingRoutes);
+
+const port = process.env.PORT || 4000;
+app.listen(port, () => {
+  console.log(`Server listening on port ${port}`);
+});
+EOF
+
+# server/prisma/schema.prisma
+cat > server/prisma/schema.prisma <<'EOF'
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  name      String
+  email     String   @unique
+  password  String
+  role      Role     @default(CUSTOMER)
+  artisan   Artisan?
+  bookings  Booking[] @relation("CustomerBookings")
+}
+
+model Artisan {
+  id         Int      @id @default(autoincrement())
+  user       User     @relation(fields: [userId], references: [id])
+  userId     Int      @unique
+  profession String
+  location   String
+  experience Int?
+  bio        String?
+  phone      String?
+  photo      String?
+  available  Boolean  @default(true)
+  skills     String?
+  price      Float?
+  bookings   Booking[]
+}
+
+model Booking {
+  id         Int           @id @default(autoincrement())
+  artisan    Artisan       @relation(fields: [artisanId], references: [id])
+  artisanId  Int
+  customer    User         @relation("CustomerBookings", fields: [customerId], references: [id])
+  customerId Int
+  date       DateTime
+  time       String
+  description String?
+  status     BookingStatus @default(PENDING)
+  createdAt  DateTime      @default(now())
+}
+
+enum Role {
+  CUSTOMER
+  ARTISAN
+  ADMIN
+}
+
+enum BookingStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  COMPLETED
+}
+EOF
+
+# server/src/middleware/auth.js
+cat > server/src/middleware/auth.js <<'EOF'
+import jwt from "jsonwebtoken";
+
+export default function authenticate(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: "Missing authorization header" });
+  const token = auth.split(" ")[1];
+  if (!token) return res.status(401).json({ error: "Invalid authorization header" });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+    req.user = decoded;
+    next();
+  } catch (err) {
+    console.error(err);
+    res.status(401).json({ error: "Invalid token" });
+  }
+}
+EOF
+
+# server/src/routes/auth.js
+cat > server/src/routes/auth.js <<'EOF'
+import express from "express";
+import { PrismaClient } from "@prisma/client";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+
+const router = express.Router();
+const prisma = new PrismaClient();
+
+// Register
+router.post("/register", async (req, res) => {
+  try {
+    const { name, email, password, role } = req.body;
+    if (!email || !password || !name) return res.status(400).json({ error: "Missing fields" });
+    const existing = await prisma.user.findUnique({ where: { email } });
+    if (existing) return res.status(400).json({ error: "Email already in use" });
+    const hashed = await bcrypt.hash(password, 10);
+    const user = await prisma.user.create({ data: { name, email, password: hashed, role } });
+    const token = jwt.sign({ userId: user.id, role: user.role }, process.env.JWT_SECRET || "secret", { expiresIn: "7d" });
+    res.json({ user: { id: user.id, name: user.name, email: user.email, role: user.role }, token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Login
+router.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: "Missing fields" });
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return res.status(400).json({ error: "Invalid credentials" });
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) return res.status(400).json({ error: "Invalid credentials" });
+    const token = jwt.sign({ userId: user.id, role: user.role }, process.env.JWT_SECRET || "secret", { expiresIn: "7d" });
+    res.json({ user: { id: user.id, name: user.name, email: user.email, role: user.role }, token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+export default router;
+EOF
+
+# server/src/routes/artisans.js
+cat > server/src/routes/artisans.js <<'EOF'
+import express from "express";
+import { PrismaClient } from "@prisma/client";
+import authenticate from "../middleware/auth.js";
+
+const router = express.Router();
+const prisma = new PrismaClient();
+
+// Create or update artisan profile (artisan must exist as user)
+router.post("/", authenticate, async (req, res) => {
+  try {
+    const { profession, location, experience, bio, phone, photo, skills, price, available } = req.body;
+    const userId = req.user.userId;
+    // Upsert artisan profile
+    const existing = await prisma.artisan.findUnique({ where: { userId } });
+    if (existing) {
+      const updated = await prisma.artisan.update({ where: { id: existing.id }, data: { profession, location, experience: experience || existing.experience, bio, phone, photo, skills, price, available } });
+      return res.json(updated);
+    }
+    const artisan = await prisma.artisan.create({ data: { userId, profession, location, experience: experience || 0, bio, phone, photo, skills, price: price || null, available: available ?? true } });
+    res.json(artisan);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Public: list artisans with optional search query (profession, location, name)
+router.get("/", async (req, res) => {
+  try {
+    const { q, profession, location, name } = req.query;
+    const where = {
+      AND: [
+        q ? { OR: [ { profession: { contains: q, mode: 'insensitive' } }, { location: { contains: q, mode: 'insensitive' } }, { bio: { contains: q, mode: 'insensitive' } }, { skills: { contains: q, mode: 'insensitive' } } ] } : {},
+        profession ? { profession: { contains: profession, mode: 'insensitive' } } : {},
+        location ? { location: { contains: location, mode: 'insensitive' } } : {}
+      ]
+    };
+    // Remove empty objects in AND
+    where.AND = where.AND.filter(o => Object.keys(o).length > 0);
+    const artisans = await prisma.artisan.findMany({ where, include: { user: true } });
+    res.json(artisans);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Get artisan by id
+router.get("/:id", async (req, res) => {
+  const id = Number(req.params.id);
+  try {
+    const artisan = await prisma.artisan.findUnique({ where: { id }, include: { user: true } });
+    if (!artisan) return res.status(404).json({ error: "Not found" });
+    res.json(artisan);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+export default router;
+EOF
+
+# server/src/routes/bookings.js
+cat > server/src/routes/bookings.js <<'EOF'
+import express from "express";
+import { PrismaClient } from "@prisma/client";
+import authenticate from "../middleware/auth.js";
+
+const router = express.Router();
+const prisma = new PrismaClient();
+
+// Create a booking (customer)
+router.post("/", authenticate, async (req, res) => {
+  try {
+    const { artisanId, date, time, description } = req.body;
+    const userId = req.user.userId;
+    // Basic validation
+    const booking = await prisma.booking.create({ data: { artisanId: Number(artisanId), customerId: userId, date: new Date(date), time, description } });
+    res.json(booking);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Artisan or customer can list bookings
+router.get("/", authenticate, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    // If artisan, return bookings for their artisan profile
+    const artisan = await prisma.artisan.findUnique({ where: { userId } });
+    if (artisan) {
+      const bookings = await prisma.booking.findMany({ where: { artisanId: artisan.id }, include: { customer: true } });
+      return res.json(bookings);
+    }
+    // Otherwise, return bookings made by the user
+    const bookings = await prisma.booking.findMany({ where: { customerId: userId }, include: { artisan: true } });
+    res.json(bookings);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Update booking status (artisan)
+router.patch("/:id/status", authenticate, async (req, res) => {
+  try {
+    const bookingId = Number(req.params.id);
+    const { status } = req.body;
+    const userId = req.user.userId;
+    const artisan = await prisma.artisan.findUnique({ where: { userId } });
+    if (!artisan) return res.status(403).json({ error: "Only artisans can update status" });
+    const booking = await prisma.booking.findUnique({ where: { id: bookingId } });
+    if (!booking || booking.artisanId !== artisan.id) return res.status(404).json({ error: "Booking not found" });
+    const updated = await prisma.booking.update({ where: { id: bookingId }, data: { status } });
+    res.json(updated);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+export default router;
+EOF
+
+# server/README-SERVER.md
+cat > server/README-SERVER.md <<'EOF'
+# Instructions
+
+This scaffold contains a minimal full-stack starter for the Artisan Finder project.
+
+Quick start (server):
+
+1. cd server
+2. npm install
+3. copy .env.example to .env and edit if needed
+4. npx prisma generate
+5. npx prisma migrate dev --name init
+6. npm run dev
+
+Quick start (client):
+
+1. cd client
+2. npm install
+3. copy .env.example to .env
+4. npm run dev
+
+API endpoints:
+- POST /api/auth/register { name, email, password, role }
+- POST /api/auth/login { email, password }
+- GET /api/artisans?q=... (search)
+- POST /api/artisans (auth required) create/update artisan profile
+- GET /api/artisans/:id
+- POST /api/bookings (auth required) { artisanId, date, time, description }
+- GET /api/bookings (auth required) list bookings for user
+EOF
+
+# Client files
+
+# client/package.json
+cat > client/package.json <<'EOF'
+{
+  "name": "artisan-finder-client",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "start": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.14.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.0.0",
+    "vite": "^5.0.0"
+  }
+}
+EOF
+
+# client/.env.example
+cat > client/.env.example <<'EOF'
+VITE_API_BASE="http://localhost:4000"
+EOF
+
+# client/src/main.jsx
+cat > client/src/main.jsx <<'EOF'
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import App from './App'
+import './index.css'
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </React.StrictMode>
+)
+EOF
+
+# client/src/index.css
+cat > client/src/index.css <<'EOF'
+body { font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; margin:0 }
+.app { max-width: 900px; margin: 0 auto }
+EOF
+
+# client/src/App.jsx
+cat > client/src/App.jsx <<'EOF'
+import React from 'react'
+import { Routes, Route } from 'react-router-dom'
+import Home from './pages/Home'
+import Login from './pages/Login'
+import Register from './pages/Register'
+import Search from './pages/Search'
+import ArtisanProfile from './pages/ArtisanProfile'
+import ArtisanEdit from './pages/ArtisanEdit'
+import Dashboard from './pages/Dashboard'
+import NavBar from './components/NavBar'
+import { AuthProvider } from './context/AuthContext'
+
+export default function App(){
+  return (
+    <AuthProvider>
+      <div className="app">
+        <NavBar />
+        <main style={{padding:16}}>
+          <Routes>
+            <Route path="/" element={<Home/>} />
+            <Route path="/login" element={<Login/>} />
+            <Route path="/register" element={<Register/>} />
+            <Route path="/search" element={<Search/>} />
+            <Route path="/artisan/:id" element={<ArtisanProfile/>} />
+            <Route path="/artisan/edit" element={<ArtisanEdit/>} />
+            <Route path="/dashboard" element={<Dashboard/>} />
+          </Routes>
+        </main>
+      </div>
+    </AuthProvider>
+  )
+}
+EOF
+
+# client/src/context/AuthContext.jsx
+cat > client/src/context/AuthContext.jsx <<'EOF'
+import React, { createContext, useContext, useState, useEffect } from 'react'
+
+const AuthContext = createContext(null)
+
+export function AuthProvider({ children }){
+  const [user, setUser] = useState(null)
+  const [token, setToken] = useState(null)
+
+  useEffect(()=>{
+    const t = localStorage.getItem('token')
+    const u = localStorage.getItem('user')
+    if (t) setToken(t)
+    if (u) setUser(JSON.parse(u))
+  },[])
+
+  function login(userObj, jwt){
+    setUser(userObj)
+    setToken(jwt)
+    localStorage.setItem('token', jwt)
+    localStorage.setItem('user', JSON.stringify(userObj))
+  }
+
+  function logout(){
+    setUser(null)
+    setToken(null)
+    localStorage.removeItem('token')
+    localStorage.removeItem('user')
+  }
+
+  async function fetchWithAuth(path, opts = {}){
+    const headers = opts.headers || {}
+    if (token) headers['Authorization'] = `Bearer ${token}`
+    headers['Content-Type'] = headers['Content-Type'] || 'application/json'
+    const res = await fetch((import.meta.env.VITE_API_BASE || 'http://localhost:4000') + path, { ...opts, headers })
+    return res
+  }
+
+  return (
+    <AuthContext.Provider value={{ user, token, login, logout, fetchWithAuth }}>
+      {children}
+    </AuthContext.Provider>
+  )
+}
+
+export function useAuth(){
+  return useContext(AuthContext)
+}
+EOF
+
+# client/src/components/NavBar.jsx
+cat > client/src/components/NavBar.jsx <<'EOF'
+import React from 'react'
+import { Link, useNavigate } from 'react-router-dom'
+import { useAuth } from '../context/AuthContext'
+
+export default function NavBar(){
+  const auth = useAuth()
+  const nav = useNavigate()
+  function onLogout(){
+    auth.logout()
+    nav('/')
+  }
+  return (
+    <header style={{padding:12,borderBottom:'1px solid #ddd',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+      <div>
+        <Link to="/">Home</Link> | <Link to="/search">Search</Link>
+      </div>
+      <div>
+        {
+
